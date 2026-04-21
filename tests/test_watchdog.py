@@ -1,197 +1,93 @@
-"""Pytest unit tests for saikou-watchdog core logic."""
+"""Pytest tests for Saikou Watchdog."""
+from unittest.mock import MagicMock, patch
+
 import pytest
 import requests
 
-from watchdog.watchdog import (
-    _check_url,
-    check_with_retries,
-    send_slack_alert,
-    call_restart_endpoint,
-    run_check_cycle,
-)
+from config import WatchdogConfig
+from watchdog import check_target, send_slack_alert, setup_logging
 
 
-# ---------------------------------------------------------------------------
-# Helpers / fixtures
-# ---------------------------------------------------------------------------
-
-BASE_CFG = {
-    "services": ["https://saikou.tech"],
-    "timeout": 10,
-    "retries": 3,
-    "slack_webhook_url": "",
-    "restart_endpoint": "",
-    "check_interval": 300,
-}
-
-
-# ---------------------------------------------------------------------------
-# 1. _check_url — success
-# ---------------------------------------------------------------------------
-
-def test_check_url_success(requests_mock):
-    requests_mock.get("https://saikou.tech", status_code=200)
-    ok, detail = _check_url("https://saikou.tech", timeout=10)
-    assert ok is True
-    assert "200" in detail
+@pytest.fixture
+def config(tmp_path):
+    return WatchdogConfig(
+        targets=["https://saikou.tech"],
+        max_retries=2,
+        retry_delay=0.0,
+        timeout=5.0,
+        slack_webhook_url="https://hooks.slack.com/test",
+        slack_channel="#test",
+        log_file=str(tmp_path / "test.log"),
+    )
 
 
-# ---------------------------------------------------------------------------
-# 2. _check_url — non-2xx treated as failure
-# ---------------------------------------------------------------------------
-
-def test_check_url_non_200(requests_mock):
-    requests_mock.get("https://saikou.tech", status_code=503)
-    ok, detail = _check_url("https://saikou.tech", timeout=10)
-    assert ok is False
-    assert "503" in detail
+@pytest.fixture
+def logger(config):
+    return setup_logging(config)
 
 
-# ---------------------------------------------------------------------------
-# 3. _check_url — connection exception
-# ---------------------------------------------------------------------------
+class TestCheckTarget:
+    def test_success_on_first_attempt(self, config, logger):
+        mock_resp = MagicMock(status_code=200)
+        with patch("watchdog.requests.get", return_value=mock_resp):
+            success, detail = check_target("https://saikou.tech", config, logger)
+        assert success is True
+        assert "200" in detail
 
-def test_check_url_exception(requests_mock):
-    requests_mock.get("https://saikou.tech", exc=requests.exceptions.ConnectionError("refused"))
-    ok, detail = _check_url("https://saikou.tech", timeout=10)
-    assert ok is False
-    assert "refused" in detail.lower() or detail != ""
+    def test_failure_after_all_retries(self, config, logger):
+        with patch("watchdog.requests.get", side_effect=requests.ConnectionError("refused")):
+            success, detail = check_target("https://saikou.tech", config, logger)
+        assert success is False
+        assert "Connection error" in detail
 
+    def test_timeout_marks_failure(self, config, logger):
+        with patch("watchdog.requests.get", side_effect=requests.Timeout):
+            success, detail = check_target("https://saikou.tech", config, logger)
+        assert success is False
+        assert "Timeout" in detail
 
-# ---------------------------------------------------------------------------
-# 4. _check_url — timeout
-# ---------------------------------------------------------------------------
+    def test_4xx_treated_as_failure(self, config, logger):
+        mock_resp = MagicMock(status_code=404)
+        with patch("watchdog.requests.get", return_value=mock_resp):
+            success, detail = check_target("https://saikou.tech", config, logger)
+        assert success is False
 
-def test_check_url_timeout(requests_mock):
-    requests_mock.get("https://saikou.tech", exc=requests.exceptions.Timeout())
-    ok, detail = _check_url("https://saikou.tech", timeout=10)
-    assert ok is False
-    assert detail == "Timeout"
-
-
-# ---------------------------------------------------------------------------
-# 5. check_with_retries — recovers on second attempt
-# ---------------------------------------------------------------------------
-
-def test_check_with_retries_recovers(requests_mock, monkeypatch):
-    # First call fails, second succeeds
-    responses = [
-        {"exc": requests.exceptions.Timeout()},
-        {"status_code": 200},
-    ]
-    requests_mock.get("https://saikou.tech", responses)
-
-    # Skip sleep
-    monkeypatch.setattr("watchdog.watchdog.time.sleep", lambda _: None)
-
-    ok, detail, attempts = check_with_retries("https://saikou.tech", timeout=10, max_attempts=3)
-    assert ok is True
-    assert attempts == 2
+    def test_success_on_second_attempt(self, config, logger):
+        fail = MagicMock(status_code=503)
+        ok = MagicMock(status_code=200)
+        with patch("watchdog.requests.get", side_effect=[fail, ok]):
+            success, detail = check_target("https://saikou.tech", config, logger)
+        assert success is True
 
 
-# ---------------------------------------------------------------------------
-# 6. check_with_retries — exhausts all attempts
-# ---------------------------------------------------------------------------
+class TestSendSlackAlert:
+    def test_returns_true_on_200(self):
+        mock_resp = MagicMock(status_code=200)
+        with patch("watchdog.requests.post", return_value=mock_resp):
+            assert send_slack_alert("https://hooks.slack.com/x", "msg") is True
 
-def test_check_with_retries_exhausted(requests_mock, monkeypatch):
-    requests_mock.get("https://saikou.tech", status_code=503)
-    monkeypatch.setattr("watchdog.watchdog.time.sleep", lambda _: None)
+    def test_returns_false_on_non_200(self):
+        mock_resp = MagicMock(status_code=500)
+        with patch("watchdog.requests.post", return_value=mock_resp):
+            assert send_slack_alert("https://hooks.slack.com/x", "msg") is False
 
-    ok, detail, attempts = check_with_retries("https://saikou.tech", timeout=10, max_attempts=3)
-    assert ok is False
-    assert attempts == 3
-    assert "503" in detail
-
-
-# ---------------------------------------------------------------------------
-# 7. send_slack_alert — posts JSON payload
-# ---------------------------------------------------------------------------
-
-def test_send_slack_alert_posts(requests_mock):
-    webhook = "https://hooks.slack.com/services/TEST/WEBHOOK"
-    requests_mock.post(webhook, status_code=200, text="ok")
-
-    send_slack_alert(webhook, "https://saikou.tech", "HTTP 503", 3)
-
-    assert requests_mock.called
-    body = requests_mock.last_request.json()
-    assert "saikou.tech" in body["text"]
-    assert "503" in body["text"]
+    def test_returns_false_on_exception(self):
+        with patch("watchdog.requests.post", side_effect=requests.RequestException):
+            assert send_slack_alert("https://hooks.slack.com/x", "msg") is False
 
 
-# ---------------------------------------------------------------------------
-# 8. send_slack_alert — skipped when no webhook configured
-# ---------------------------------------------------------------------------
+class TestWatchdogConfig:
+    def test_from_env(self, monkeypatch):
+        monkeypatch.setenv("WATCHDOG_TARGETS", "https://saikou.tech,https://api.saikou.tech")
+        monkeypatch.setenv("WATCHDOG_MAX_RETRIES", "5")
+        monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/xyz")
+        config = WatchdogConfig.from_env()
+        assert len(config.targets) == 2
+        assert config.max_retries == 5
+        assert config.slack_webhook_url == "https://hooks.slack.com/xyz"
 
-def test_send_slack_alert_no_webhook(requests_mock):
-    send_slack_alert("", "https://saikou.tech", "Timeout", 3)
-    assert not requests_mock.called
-
-
-# ---------------------------------------------------------------------------
-# 9. call_restart_endpoint — posts to endpoint
-# ---------------------------------------------------------------------------
-
-def test_call_restart_endpoint(requests_mock):
-    endpoint = "https://restart.example.com/restart"
-    requests_mock.post(endpoint, status_code=200)
-
-    call_restart_endpoint(endpoint, "https://saikou.tech")
-
-    assert requests_mock.called
-    body = requests_mock.last_request.json()
-    assert body["service"] == "https://saikou.tech"
-
-
-# ---------------------------------------------------------------------------
-# 10. run_check_cycle — healthy service, no alerts
-# ---------------------------------------------------------------------------
-
-def test_run_check_cycle_all_healthy(requests_mock, monkeypatch):
-    requests_mock.get("https://saikou.tech", status_code=200)
-    monkeypatch.setattr("watchdog.watchdog.time.sleep", lambda _: None)
-
-    results = run_check_cycle(BASE_CFG)
-    assert results["https://saikou.tech"] is True
-
-
-# ---------------------------------------------------------------------------
-# 11. run_check_cycle — failing service triggers slack + restart
-# ---------------------------------------------------------------------------
-
-def test_run_check_cycle_failure_triggers_alerts(requests_mock, monkeypatch):
-    webhook = "https://hooks.slack.com/services/TEST/WEBHOOK"
-    restart = "https://restart.example.com/restart"
-
-    requests_mock.get("https://saikou.tech", status_code=503)
-    requests_mock.post(webhook, status_code=200, text="ok")
-    requests_mock.post(restart, status_code=200)
-
-    monkeypatch.setattr("watchdog.watchdog.time.sleep", lambda _: None)
-
-    cfg = {**BASE_CFG, "slack_webhook_url": webhook, "restart_endpoint": restart}
-    results = run_check_cycle(cfg)
-
-    assert results["https://saikou.tech"] is False
-
-    # Both Slack and restart endpoint must have been called
-    posted_urls = [r.url for r in requests_mock.request_history if r.method == "POST"]
-    assert webhook in posted_urls
-    assert restart in posted_urls
-
-
-# ---------------------------------------------------------------------------
-# 12. run_check_cycle — multiple services, mixed results
-# ---------------------------------------------------------------------------
-
-def test_run_check_cycle_mixed(requests_mock, monkeypatch):
-    requests_mock.get("https://saikou.tech", status_code=200)
-    requests_mock.get("https://down.example.com", status_code=500)
-
-    monkeypatch.setattr("watchdog.watchdog.time.sleep", lambda _: None)
-
-    cfg = {**BASE_CFG, "services": ["https://saikou.tech", "https://down.example.com"]}
-    results = run_check_cycle(cfg)
-
-    assert results["https://saikou.tech"] is True
-    assert results["https://down.example.com"] is False
+    def test_defaults(self):
+        config = WatchdogConfig()
+        assert config.max_retries == 3
+        assert config.check_interval == 60.0
+        assert config.log_backup_count == 5

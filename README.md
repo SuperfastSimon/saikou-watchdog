@@ -1,111 +1,42 @@
 # Saikou Watchdog
 
-Production-ready service health monitor for [saikou.tech](https://saikou.tech).  
-Checks URLs on a schedule, retries on failure, triggers restarts, and fires Slack alerts.  
-Deployable as a Render long-running process or a cron job.
+Production-ready service health monitor for the Saikou.tech platform.
 
----
+## Features
 
-## File Tree
+- **Multi-target monitoring** - watch any number of URLs
+- **Configurable retries** - with delay between attempts
+- **Slack alerts** - instant notifications when a service goes down
+- **Rotating logs** - disk-safe rotating file logs (configurable size + backups)
+- **CLI interface** - run from terminal with full argument support
+- **Environment-driven config** - 12-factor app compatible
 
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+
+python cli.py https://saikou.tech https://api.saikou.tech \
+  --slack-webhook https://hooks.slack.com/YOUR_WEBHOOK \
+  --interval 30 \
+  --retries 3
 ```
-saikou-watchdog/
-├── watchdog/
-│   ├── __init__.py
-│   ├── config.py        # Env-var configuration
-│   ├── watchdog.py      # Core logic: check, retry, alert, restart
-│   └── cli.py           # Argparse entrypoint
-├── tests/
-│   └── test_watchdog.py # 12 pytest unit tests
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
----
 
 ## Environment Variables
 
-| Variable           | Default                  | Description                                      |
-|--------------------|--------------------------|--------------------------------------------------|
-| `SERVICES`         | `https://saikou.tech`    | Comma-separated URLs to monitor                  |
-| `CHECK_INTERVAL`   | `300`                    | Seconds between check cycles (loop mode)         |
-| `TIMEOUT`          | `10`                     | HTTP request timeout in seconds                  |
-| `RETRIES`          | `3`                      | Total attempts per service (1 initial + retries) |
-| `SLACK_WEBHOOK_URL`| *(empty — disabled)*     | Slack Incoming Webhook URL for alerts            |
-| `RESTART_ENDPOINT` | *(empty — disabled)*     | POST endpoint called on failure (e.g. Render deploy hook) |
-
----
-
-## Retry Behaviour
-
-- Attempt 1 → wait 5s → Attempt 2 → wait 10s → Attempt 3
-- Exponential backoff: `5 × 2^(attempt-1)` seconds
-- If all attempts fail: call `RESTART_ENDPOINT` (once) then send Slack alert
-
----
-
-## Setup
-
-```bash
-git clone https://github.com/SuperfastSimon/saikou-watchdog
-cd saikou-watchdog
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Copy and edit your environment:
-
-```bash
-cp .env.example .env   # or export vars directly
-```
-
----
-
-## Usage
-
-### Run once (cron mode)
-
-```bash
-python -m watchdog.cli --once
-```
-
-Exit code `0` = all healthy, `1` = one or more services down.
-
-**Crontab example** (every 5 minutes):
-
-```cron
-*/5 * * * * cd /opt/saikou-watchdog && /opt/saikou-watchdog/.venv/bin/python -m watchdog.cli --once >> /var/log/watchdog-cron.log 2>&1
-```
-
-### Run forever (Render / Docker)
-
-```bash
-python -m watchdog.cli
-```
-
-or explicitly:
-
-```bash
-python -m watchdog.cli --loop
-```
-
----
-
-## Render Deployment
-
-1. Create a new **Background Worker** service on Render.
-2. Set **Build Command**: `pip install -r requirements.txt`
-3. Set **Start Command**: `python -m watchdog.cli`
-4. Add environment variables in the Render dashboard.
-
-That's it — Render keeps the process alive and restarts it on crash.
-
-**Render deploy hook as RESTART_ENDPOINT:**  
-Grab your service's deploy hook URL from Render → Settings → Deploy Hook,  
-then set `RESTART_ENDPOINT=https://api.render.com/deploy/srv-XXXX?key=YYYY`.
-
----
+| Variable | Default | Description |
+|---|---|---|
+| `WATCHDOG_TARGETS` | - | Comma-separated URLs to monitor |
+| `WATCHDOG_MAX_RETRIES` | `3` | Retries before marking down |
+| `WATCHDOG_RETRY_DELAY` | `5.0` | Seconds between retries |
+| `WATCHDOG_TIMEOUT` | `10.0` | Request timeout (seconds) |
+| `WATCHDOG_CHECK_INTERVAL` | `60.0` | Seconds between check cycles |
+| `SLACK_WEBHOOK_URL` | - | Slack incoming webhook URL |
+| `SLACK_CHANNEL` | `#alerts` | Slack channel name |
+| `WATCHDOG_LOG_FILE` | `watchdog.log` | Log file path |
+| `WATCHDOG_LOG_MAX_BYTES` | `10485760` | Max log file size (bytes) |
+| `WATCHDOG_LOG_BACKUP_COUNT` | `5` | Number of rotated log backups |
+| `WATCHDOG_LOG_LEVEL` | `INFO` | Logging level |
 
 ## Running Tests
 
@@ -113,53 +44,23 @@ then set `RESTART_ENDPOINT=https://api.render.com/deploy/srv-XXXX?key=YYYY`.
 pytest tests/ -v
 ```
 
-Expected output:
+## Package Structure
 
 ```
-tests/test_watchdog.py::test_check_url_success PASSED
-tests/test_watchdog.py::test_check_url_non_200 PASSED
-tests/test_watchdog.py::test_check_url_exception PASSED
-tests/test_watchdog.py::test_check_url_timeout PASSED
-tests/test_watchdog.py::test_check_with_retries_recovers PASSED
-tests/test_watchdog.py::test_check_with_retries_exhausted PASSED
-tests/test_watchdog.py::test_send_slack_alert_posts PASSED
-tests/test_watchdog.py::test_send_slack_alert_no_webhook PASSED
-tests/test_watchdog.py::test_call_restart_endpoint PASSED
-tests/test_watchdog.py::test_run_check_cycle_all_healthy PASSED
-tests/test_watchdog.py::test_run_check_cycle_failure_triggers_alerts PASSED
-tests/test_watchdog.py::test_run_check_cycle_mixed PASSED
-
-12 passed in 0.XXs
+saikou-watchdog/
+|-- config.py
+|-- watchdog.py
+|-- cli.py
+|-- tests/
+|   |-- __init__.py
+|   +-- test_watchdog.py
+|-- requirements.txt
+|-- setup.py
++-- README.md
 ```
 
----
+## Genesis Protocol Integration
 
-## Slack Alert Format
-
-```
-🔴 Watchdog Alert — service is DOWN
-• URL: https://saikou.tech
-• Reason: HTTP 503
-• Attempts: 3
-• Time (UTC): 2026-04-21T10:00:00+00:00
-```
-
----
-
-## Log Output (watchdog.log)
-
-Rotating log, 5 MB × 3 backups. Sample:
-
-```
-2026-04-21 10:00:00,123 [INFO] Checking https://saikou.tech …
-2026-04-21 10:00:01,456 [INFO]   [OK] https://saikou.tech — HTTP 200
-2026-04-21 10:05:00,789 [INFO] Checking https://saikou.tech …
-2026-04-21 10:05:11,012 [WARNING]   attempt 1/3 failed: Timeout
-2026-04-21 10:05:11,013 [INFO]   Retrying in 5s …
-2026-04-21 10:05:16,500 [WARNING]   attempt 2/3 failed: Timeout
-2026-04-21 10:05:16,501 [INFO]   Retrying in 10s …
-2026-04-21 10:05:27,200 [WARNING]   attempt 3/3 failed: Timeout
-2026-04-21 10:05:27,201 [ERROR]   [DOWN] https://saikou.tech — Timeout (after 3 attempt(s))
-2026-04-21 10:05:27,202 [INFO]   Restart endpoint called → HTTP 200
-2026-04-21 10:05:27,400 [INFO]   Slack alert sent for https://saikou.tech
-```
+This watchdog is a component of the **Genesis Protocol Maintainer Agent**.
+It can be triggered by the Boss Agent to health-check deployed services
+and report back via Slack or log files.
