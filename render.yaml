@@ -4,11 +4,17 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python watchdog.py
+    startCommand: python cli.py
     envVars:
+      - key: WATCHDOG_TARGETS
+        sync: false
       - key: SLACK_WEBHOOK_URL
         sync: false
-      - key: TARGETS
-        sync: false
-      - key: CHECK_INTERVAL
+      - key: SLACK_CHANNEL
+        value: "#alerts"
+      - key: WATCHDOG_CHECK_INTERVAL
         value: "60"
+      - key: WATCHDOG_MAX_RETRIES
+        value: "3"
+      - key: WATCHDOG_LOG_LEVEL
+        value: "INFO"
